@@ -1,3 +1,5 @@
+import { AnsiUp } from "./ansi_up.js";
+
 require.config({
     paths: {
         vs: "https://unpkg.com/monaco-editor@0.55.1/min/vs",
@@ -264,7 +266,11 @@ fn main() -> i32 {
             });
             eventSource.addEventListener("complete", (event) => {
                 const data = JSON.parse(event.data);
-                output.textContent = `${data.stderr}${data.stdout}- Execution completed with exit code ${data.exit_code}`;
+                let text = `${data.stderr}${data.stdout}- Execution completed with exit code ${data.exit_code}`;
+                let ansi = new AnsiUp();
+                text = ansi.ansi_to_html(text);
+                // safe because ansiup sanitizes the output
+                output.innerHTML = text;
                 eventSource.close();
             });
         } catch (e) {
