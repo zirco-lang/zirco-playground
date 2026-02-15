@@ -1,0 +1,32 @@
+DENY { 
+    socket, connect, bind, listen, accept, accept4,
+    sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg,
+    socketpair, setsockopt, getsockopt, shutdown,
+    
+    unlink, unlinkat, rmdir,
+    mkdir, mkdirat,
+    rename, renameat, renameat2,
+    chmod, fchmod, fchmodat,
+    chown, fchown, lchown, fchownat,
+    
+    mount, umount,
+    pivot_root, chroot,
+    init_module, finit_module, delete_module,
+    reboot, sethostname, setdomainname,
+    settimeofday, adjtimex, clock_settime,
+    swapon, swapoff, quotactl,
+    kexec_load, kexec_file_load,
+    ioperm, iopl, uselib, acct,
+    
+    ptrace, process_vm_readv, process_vm_writev,
+    setuid, setgid, setreuid, setregid,
+    setresuid, setresgid, setfsuid, setfsgid,
+    capset,
+    
+    unshare, setns,
+    
+    perf_event_open,
+    
+    add_key, request_key, keyctl
+}
+DEFAULT ALLOW

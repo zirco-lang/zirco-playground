@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Zirco Playground</title>
+        <link rel="stylesheet" href="style.css" />
+    </head>
+
+    <body>
+        <header>
+            <b>Zirco Playground</b>
+            <div><span id="toolchain"></span></div>
+        </header>
+        <div id="tools">
+            <span>Action: </span>
+            <select id="action">
+                <option value="execute">Run</option>
+                <option value="lint">Lint (zircop)</option>
+                <option value="tast">View TAST</option>
+                <option value="llvm">View LLVM IR</option>
+            </select>
+            <button id="run">Go</button>
+        </div>
+        <div id="editor"></div>
+        <div id="output"></div>
+    </body>
+
+    <script src="https://unpkg.com/monaco-editor@0.55.1/min/vs/loader.js"></script>
+    <script type="module" src="main.js"></script>
+</html>

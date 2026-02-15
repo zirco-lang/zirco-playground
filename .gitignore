@@ -1,0 +1,6 @@
+target
+/result
+/.direnv
+/server/zrc-nightly
+/server/metrics.json
+/server/work
