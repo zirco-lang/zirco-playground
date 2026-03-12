@@ -104,15 +104,24 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3000);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener_v4 = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .unwrap();
+    let listener_v6 = tokio::net::TcpListener::bind(format!("[::]:{port}"))
         .await
         .unwrap();
 
-    info!("Listening on http://localhost:{port}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    info!("Listening on :{port}");
+
+    tokio::join!(
+        axum::serve(
+            listener_v4,
+            app.clone()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        ),
+        axum::serve(
+            listener_v6,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ),
+    );
 }
