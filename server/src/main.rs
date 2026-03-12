@@ -104,15 +104,11 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3000);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = tokio::net::TcpListener::bind(format!("[::]:{port}"))
         .await
         .unwrap();
 
-    info!("Listening on http://localhost:{port}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    info!("Listening on port {port} (IPv4 + IPv6)");
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).await.unwrap();
 }

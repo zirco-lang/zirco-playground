@@ -13,7 +13,7 @@ pub async fn worker(i: usize, rx: async_channel::Receiver<Job>, results: Results
             Ok(job) => job,
             Err(e) => {
                 error!("Worker {i} shutting down: {e}");
-                continue;
+                return;
             }
         };
 
