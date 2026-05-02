@@ -208,16 +208,73 @@ require(["vs/editor/editor.main"], function () {
         },
     });
 
-    // Create editor
-    monaco.editor.create(document.getElementById("editor"), {
-        value: `#include <libc/stdio.zh>
+    const defaultCode = `#include <libc/stdio.zh>
 fn main() -> i32 {
     printf("Hello, Zirco!\\n");
     return 0;
 }
-`,
+`;
+
+    const MAX_URL_CODE_LENGTH = 50000;
+
+    function loadFromURL() {
+        try {
+            const params = new URLSearchParams(location.hash.slice(1));
+            const code = params.get("code");
+            const action = params.get("action");
+            return { code, action };
+        } catch (e) {
+            return { code: null, action: null };
+        }
+    }
+
+    function updateURL(code, action) {
+        if (code.length > MAX_URL_CODE_LENGTH) {
+            return;
+        }
+        const params = new URLSearchParams();
+        params.set("code", code);
+        params.set("action", action);
+        history.replaceState(null, "", "#" + params.toString());
+    }
+
+    const { code: urlCode, action: urlAction } = loadFromURL();
+
+    const actionSelect = document.getElementById("action");
+    if (urlAction) {
+        const matchingOption = Array.from(actionSelect.options).find(
+            (opt) => opt.value === urlAction,
+        );
+        if (matchingOption) {
+            actionSelect.value = urlAction;
+        }
+    }
+
+    const editorValue =
+        urlCode !== null && urlCode.length <= MAX_URL_CODE_LENGTH
+            ? urlCode
+            : defaultCode;
+
+    const editor = monaco.editor.create(document.getElementById("editor"), {
+        value: editorValue,
         language: "zirco",
         theme: "vs-dark",
+    });
+
+    if (urlCode === null) {
+        updateURL(editor.getValue(), actionSelect.value);
+    }
+
+    let urlUpdateTimer = null;
+    editor.onDidChangeModelContent(() => {
+        clearTimeout(urlUpdateTimer);
+        urlUpdateTimer = setTimeout(() => {
+            updateURL(editor.getValue(), actionSelect.value);
+        }, 300);
+    });
+
+    actionSelect.addEventListener("change", () => {
+        updateURL(editor.getValue(), actionSelect.value);
     });
 
     const ver = document.getElementById("toolchain");
@@ -232,8 +289,8 @@ fn main() -> i32 {
         });
 
     document.getElementById("run").onclick = async function run() {
-        const code = monaco.editor.getModels()[0].getValue();
-        const action = document.getElementById("action").value;
+        const code = editor.getValue();
+        const action = actionSelect.value;
 
         const { jobId } = await fetch("https://play.zirco.dev/api/v1/execute", {
             method: "POST",
