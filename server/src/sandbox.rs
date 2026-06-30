@@ -17,7 +17,7 @@ const OUTPUT_LIMIT_BYTES: usize = 1024 * 100; // 100 KiB
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT_WARNING: &str =
-    "[warning] Process output exceeded 1 KiB; the process was SIGKILLed.\n";
+    "[warning] Process output exceeded 100 KiB; the process was SIGKILLed.\n";
 
 async fn cleanup_work_dir(work_dir: &str) {
     let _ = tokio::fs::remove_dir_all(work_dir).await;
