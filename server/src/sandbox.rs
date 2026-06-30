@@ -1,9 +1,97 @@
 use std::{process::Stdio, time::Duration};
 
-use tokio::{process::Command, time::timeout};
+use nix::libc;
+use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 use tracing::debug;
 
 use crate::models::{Job, JobResult};
+
+const COMMON_PRLIMIT_ARGS: [&str; 4] = [
+    "--as=536870912",    // 512 MB
+    "--cpu=10",          // 10 seconds of CPU time
+    "--fsize=104857600", // 100 MB file size
+    "--",
+];
+
+const OUTPUT_LIMIT_BYTES: usize = 1024;
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_LIMIT_WARNING: &str =
+    "[warning] Process output exceeded 1 KiB; the process was SIGKILLed.\n";
+
+async fn cleanup_work_dir(work_dir: &str) {
+    let _ = tokio::fs::remove_dir_all(work_dir).await;
+}
+
+#[derive(Debug)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn capture_stream<R>(
+    mut reader: R,
+    pid: libc::pid_t,
+    stream_name: &'static str,
+) -> Result<CapturedStream, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 512];
+    let mut truncated = false;
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("Failed to read {stream_name}: {e}"))?;
+
+        if read == 0 {
+            break;
+        }
+
+        if bytes.len() < OUTPUT_LIMIT_BYTES {
+            let remaining = OUTPUT_LIMIT_BYTES - bytes.len();
+            let take = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..take]);
+            if take < read || bytes.len() >= OUTPUT_LIMIT_BYTES {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+
+        if truncated {
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+            break;
+        }
+    }
+
+    Ok(CapturedStream { bytes, truncated })
+}
+
+fn prlimit_command(program: &str) -> Command {
+    let mut command = Command::new("prlimit");
+    command.args(COMMON_PRLIMIT_ARGS);
+    command.arg(program);
+    command
+}
+
+fn zrc_command(program: &str, source_path: &str) -> Command {
+    let mut command = prlimit_command(program);
+    command.args([
+        "-I",
+        "./zrc-nightly/include",
+        "-I",
+        "./zrc-nightly/libzr/include",
+        "--forbid-unlisted-includes",
+        source_path,
+    ]);
+    command
+}
 
 pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
     let work_dir = format!("./work/{}", job.id);
@@ -24,22 +112,8 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         debug!("Starting linting for job {}", job.id);
 
         let lint_result = timeout(
-            Duration::from_secs(10),
-            Command::new("prlimit")
-                .args([
-                    "--as=536870912",    // 512 MB
-                    "--cpu=10",          // 10 seconds of CPU time
-                    "--fsize=104857600", // 100 MB file size
-                    "--",
-                    "./zrc-nightly/bin/zircop",
-                    "-I",
-                    "./zrc-nightly/include",
-                    "-I",
-                    "./zrc-nightly/libzr/include",
-                    "--forbid-unlisted-includes",
-                    &source_path,
-                ])
-                .output(),
+            COMPILE_TIMEOUT,
+            zrc_command("./zrc-nightly/bin/zircop", &source_path).output(),
         )
         .await;
 
@@ -47,12 +121,12 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Err(format!("Failed to spawn linting process: {e}"));
             }
             Err(_) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Ok(JobResult {
                     stdout: "".to_string(),
                     stderr: "Linting timed out after 10 seconds".to_string(),
@@ -62,7 +136,7 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         };
 
         // Clean up the work directory after execution
-        let _ = tokio::fs::remove_dir_all(work_dir).await;
+        cleanup_work_dir(&work_dir).await;
 
         return Ok(JobResult {
             stdout: String::from_utf8_lossy(&lint_result.stdout).to_string(),
@@ -76,38 +150,23 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
     if job.task_type == crate::models::TaskType::Tast {
         // For TAST, we invoke zrc with --emit tast and return the output without linking or executing.
 
-        let tast_result = timeout(
-            Duration::from_secs(10),
-            Command::new("prlimit")
-                .args([
-                    "--as=536870912",    // 512 MB
-                    "--cpu=10",          // 10 seconds of CPU time
-                    "--fsize=104857600", // 100 MB file size
-                    "--",
-                    "./zrc-nightly/bin/zrc",
-                    "-I",
-                    "./zrc-nightly/include",
-                    "-I",
-                    "./zrc-nightly/libzr/include",
-                    "--emit",
-                    "tast",
-                    "--forbid-unlisted-includes",
-                    &source_path,
-                ])
-                .output(),
-        )
+        let tast_result = timeout(COMPILE_TIMEOUT, {
+            let mut command = zrc_command("./zrc-nightly/bin/zrc", &source_path);
+            command.args(["--emit", "tast"]);
+            command.output()
+        })
         .await;
 
         let tast_result = match tast_result {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Err(format!("Failed to spawn TAST generation process: {e}"));
             }
             Err(_) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Ok(JobResult {
                     stdout: "".to_string(),
                     stderr: "TAST generation timed out after 10 seconds".to_string(),
@@ -117,7 +176,7 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         };
 
         // Clean up the work directory after execution
-        let _ = tokio::fs::remove_dir_all(work_dir).await;
+        cleanup_work_dir(&work_dir).await;
 
         return Ok(JobResult {
             stdout: String::from_utf8_lossy(&tast_result.stdout).to_string(),
@@ -127,38 +186,23 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
     } else if job.task_type == crate::models::TaskType::Llvm {
         // For LLVM IR, we invoke zrc with --emit llvm and return the output without linking or executing.
 
-        let llvm_result = timeout(
-            Duration::from_secs(10),
-            Command::new("prlimit")
-                .args([
-                    "--as=536870912",    // 512 MB
-                    "--cpu=10",          // 10 seconds of CPU time
-                    "--fsize=104857600", // 100 MB file size
-                    "--",
-                    "./zrc-nightly/bin/zrc",
-                    "-I",
-                    "./zrc-nightly/include",
-                    "-I",
-                    "./zrc-nightly/libzr/include",
-                    "--emit",
-                    "llvm",
-                    "--forbid-unlisted-includes",
-                    &source_path,
-                ])
-                .output(),
-        )
+        let llvm_result = timeout(COMPILE_TIMEOUT, {
+            let mut command = zrc_command("./zrc-nightly/bin/zrc", &source_path);
+            command.args(["--emit", "llvm"]);
+            command.output()
+        })
         .await;
 
         let llvm_result = match llvm_result {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Err(format!("Failed to spawn LLVM IR generation process: {e}"));
             }
             Err(_) => {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Ok(JobResult {
                     stdout: "".to_string(),
                     stderr: "LLVM IR generation timed out after 10 seconds".to_string(),
@@ -168,7 +212,7 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         };
 
         // Clean up the work directory after execution
-        let _ = tokio::fs::remove_dir_all(work_dir).await;
+        cleanup_work_dir(&work_dir).await;
 
         return Ok(JobResult {
             stdout: String::from_utf8_lossy(&llvm_result.stdout).to_string(),
@@ -177,29 +221,12 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         });
     }
 
-    let compile_result = timeout(
-        Duration::from_secs(10),
-        Command::new("prlimit")
-            .args([
-                "--as=536870912",    // 512 MB
-                "--cpu=10",          // 10 seconds of CPU time
-                "--fsize=104857600", // 100 MB file size
-                "--",
-                "./zrc-nightly/bin/zrc",
-                "-I",
-                "./zrc-nightly/include",
-                "-I",
-                "./zrc-nightly/libzr/include",
-                "--emit",
-                "object",
-                "-o",
-                &obj_path,
-                "--forbid-unlisted-includes",
-                &source_path,
-            ])
-            .stdout(Stdio::null())
-            .output(),
-    )
+    let compile_result = timeout(COMPILE_TIMEOUT, {
+        let mut command = zrc_command("./zrc-nightly/bin/zrc", &source_path);
+        command.args(["--emit", "object", "-o", &obj_path]);
+        command.stdout(Stdio::null());
+        command.output()
+    })
     .await;
 
     match compile_result {
@@ -215,7 +242,7 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
                 );
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 return Ok(JobResult {
                     stdout: "".to_string(),
                     stderr,
@@ -225,12 +252,12 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         }
         Ok(Err(e)) => {
             // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
+            cleanup_work_dir(&work_dir).await;
             return Err(format!("Failed to spawn compilation process: {e}"));
         }
         Err(_) => {
             // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
+            cleanup_work_dir(&work_dir).await;
             return Ok(JobResult {
                 stdout: "".to_string(),
                 stderr: "Compilation timed out after 10 seconds".to_string(),
@@ -242,25 +269,19 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
     debug!("Starting linking for job {}", job.id);
 
     // Now run clang -lc -lzr -o main main.o
-    let link_result = timeout(
-        Duration::from_secs(10),
-        Command::new("prlimit")
-            .args([
-                "--as=536870912",    // 512 MB
-                "--cpu=10",          // 10 seconds of CPU time
-                "--fsize=104857600", // 100 MB file size
-                "--",
-                "clang",
-                &obj_path,
-                "-o",
-                &main_path,
-                "./zrc-nightly/libzr/lib/libzr.a",
-                "-lc",
-                "-static",
-            ])
-            .stdout(Stdio::null())
-            .output(),
-    )
+    let link_result = timeout(COMPILE_TIMEOUT, {
+        let mut command = prlimit_command("clang");
+        command.args([
+            &obj_path,
+            "-o",
+            &main_path,
+            "./zrc-nightly/libzr/lib/libzr.a",
+            "-lc",
+            "-static",
+        ]);
+        command.stdout(Stdio::null());
+        command.output()
+    })
     .await;
 
     match link_result {
@@ -270,7 +291,7 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
                 // linking completed successfully, proceed to execution
             } else {
                 // Clean up the work directory after execution
-                let _ = tokio::fs::remove_dir_all(work_dir).await;
+                cleanup_work_dir(&work_dir).await;
                 debug!(
                     "Linking failed for job {} with exit code {:?}",
                     job.id,
@@ -286,12 +307,12 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         }
         Ok(Err(e)) => {
             // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
+            cleanup_work_dir(&work_dir).await;
             return Err(format!("Failed to spawn linking process: {e}"));
         }
         Err(_) => {
             // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
+            cleanup_work_dir(&work_dir).await;
             return Ok(JobResult {
                 stdout: "".to_string(),
                 stderr: "Linking timed out after 10 seconds".to_string(),
@@ -313,44 +334,71 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         .to_string();
 
     debug!("Starting execution for job {}", job.id);
-    let exec_result = timeout(
-        Duration::from_secs(30),
-        Command::new("nsjail")
-            .args([
-                "--quiet",
-                "--bindmount",
-                &format!("{}:/work", normalized_work_dir),
-                "--time_limit",
-                "30",
-                "--rlimit_as",
-                "536870912",
-                "--rlimit_cpu",
-                "30",
-                "--rlimit_nofile",
-                "20",
-                "--seccomp_policy",
-                "./seccomp.policy",
-                "--user",
-                "9999",
-                "--group",
-                "9999",
-                "--",
-                "/work/main",
-            ])
-            .output(),
-    )
-    .await;
+    let mut exec_command = Command::new("nsjail");
+    exec_command.args([
+        "--quiet",
+        "--bindmount",
+        &format!("{}:/work", normalized_work_dir),
+        "--time_limit",
+        "30",
+        "--rlimit_as",
+        "536870912",
+        "--rlimit_cpu",
+        "30",
+        "--rlimit_nofile",
+        "20",
+        "--seccomp_policy",
+        "./seccomp.policy",
+        "--user",
+        "9999",
+        "--group",
+        "9999",
+        "--",
+        "/work/main",
+    ]);
+    exec_command.stdin(Stdio::null());
+    exec_command.stdout(Stdio::piped());
+    exec_command.stderr(Stdio::piped());
 
-    let exec_result = match exec_result {
-        Ok(Ok(output)) => output,
+    let mut child = exec_command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn execution process: {e}"))?;
+
+    let pid = child
+        .id()
+        .map(|raw_pid| raw_pid as libc::pid_t)
+        .ok_or_else(|| "Failed to get execution process id".to_string())?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture execution stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture execution stderr".to_string())?;
+
+    let stdout_handle = tokio::spawn(capture_stream(stdout, pid, "stdout"));
+    let stderr_handle = tokio::spawn(capture_stream(stderr, pid, "stderr"));
+
+    let exec_status = match timeout(EXECUTION_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
         Ok(Err(e)) => {
-            // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
-            return Err(format!("Failed to spawn execution process: {e}"));
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+            cleanup_work_dir(&work_dir).await;
+            return Err(format!("Failed to wait for execution process: {e}"));
         }
         Err(_) => {
-            // Clean up the work directory after execution
-            let _ = tokio::fs::remove_dir_all(work_dir).await;
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+            cleanup_work_dir(&work_dir).await;
             return Ok(JobResult {
                 stdout: "".to_string(),
                 stderr: "Execution timed out after 30 seconds".to_string(),
@@ -359,12 +407,26 @@ pub async fn sandboxed_execution(job: Job) -> Result<JobResult, String> {
         }
     };
 
+    let stdout_capture = stdout_handle
+        .await
+        .map_err(|e| format!("Failed to join stdout reader: {e}"))??;
+    let stderr_capture = stderr_handle
+        .await
+        .map_err(|e| format!("Failed to join stderr reader: {e}"))??;
+
+    let stdout = String::from_utf8_lossy(&stdout_capture.bytes).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_capture.bytes).to_string();
+
+    if stdout_capture.truncated || stderr_capture.truncated {
+        stderr.push_str(OUTPUT_LIMIT_WARNING);
+    }
+
     // Clean up the work directory after execution
-    let _ = tokio::fs::remove_dir_all(work_dir).await;
+    cleanup_work_dir(&work_dir).await;
 
     Ok(JobResult {
-        stdout: String::from_utf8_lossy(&exec_result.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&exec_result.stderr).to_string(),
-        exit_code: exec_result.status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        exit_code: exec_status.code().unwrap_or(-1),
     })
 }
