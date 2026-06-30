@@ -13,7 +13,7 @@ const COMMON_PRLIMIT_ARGS: [&str; 4] = [
     "--",
 ];
 
-const OUTPUT_LIMIT_BYTES: usize = 1024;
+const OUTPUT_LIMIT_BYTES: usize = 1024 * 100; // 100 KiB
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(10);
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT_WARNING: &str =
